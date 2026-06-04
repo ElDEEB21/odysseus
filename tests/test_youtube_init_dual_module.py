@@ -15,9 +15,12 @@ the diagnostics endpoint worked.
 
 The fix is for ``app.py`` to call both ``init_youtube()`` variants at startup
 so both code paths see the same state. This test fails on the broken version
-and passes after the fix is applied.
+and passes after the fix is applied. The static check uses ``ast`` so the test
+is robust to harmless refactors (e.g. aliasing the imports, reformatting, or
+moving the call into a helper function).
 """
-import re
+import ast
+import asyncio
 import sys
 import types
 from pathlib import Path
@@ -30,39 +33,75 @@ if str(ROOT) not in sys.path:
 
 APP_PY = ROOT / "app.py"
 
+# (module, expected-call-name-or-None) pairs the regression guarantees.
+# The second entry uses None as a sentinel: the call name is whatever the
+# import was bound to (e.g. ``init_youtube`` or ``init_youtube_src``).
+REQUIRED_INITIALIZERS = (
+    ("services.youtube", "init_youtube"),
+    ("src.youtube_handler", None),
+)
 
-def _read_app_py() -> str:
-    return APP_PY.read_text(encoding="utf-8")
+
+def _parse_app_py() -> ast.Module:
+    return ast.parse(APP_PY.read_text(encoding="utf-8"), filename=str(APP_PY))
 
 
-def test_app_py_initializes_src_youtube_handler():
-    """app.py must call init_youtube() on src.youtube_handler, not just the services one."""
-    source = _read_app_py()
+def _collect_init_imports(tree: ast.Module) -> dict[str, str]:
+    """Return {module: bound-name} for every `from <module> import init_youtube[ as X]`."""
+    found: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        if node.module not in {module for module, _ in REQUIRED_INITIALIZERS}:
+            continue
+        for alias in node.names:
+            if alias.name == "init_youtube":
+                found[node.module] = alias.asname or alias.name
+    return found
 
-    # Both imports must be present.
-    assert re.search(
-        r"^\s*from\s+services\.youtube\s+import\s+init_youtube\b",
-        source,
-        re.MULTILINE,
-    ), "app.py is missing `from services.youtube import init_youtube`"
-    assert re.search(
-        r"^\s*from\s+src\.youtube_handler\s+import\s+init_youtube\b",
-        source,
-        re.MULTILINE,
-    ), (
-        "app.py is missing `from src.youtube_handler import init_youtube`. "
-        "The chat-path YouTube handler is never initialized, so chat requests "
-        "with a YouTube URL always fail with 'YouTube transcript API not available'."
-    )
 
-    # Both call sites must be present in the YouTube init block. Look for
-    # `init_youtube(` call expressions after the imports above.
-    assert "init_youtube()" in source, "app.py never calls init_youtube()"
+def _collect_module_level_calls(tree: ast.Module) -> set[str]:
+    """Return the set of call names executed at module level (top-level Expr -> Call)."""
+    calls: set[str] = set()
+    for stmt in tree.body:
+        if not isinstance(stmt, ast.Expr):
+            continue
+        call = stmt.value
+        if not isinstance(call, ast.Call):
+            continue
+        func = call.func
+        if isinstance(func, ast.Name):
+            calls.add(func.id)
+    return calls
+
+
+def test_app_py_initializes_both_youtube_handlers():
+    """Both YouTube handler modules' init_youtube() must be called at app startup."""
+    tree = _parse_app_py()
+    imports = _collect_init_imports(tree)
+    calls = _collect_module_level_calls(tree)
+
+    for module, expected_name in REQUIRED_INITIALIZERS:
+        assert module in imports, (
+            f"app.py is missing `from {module} import init_youtube`. "
+            "Both YouTube handler modules need to be initialized at startup; "
+            "see the PR description for the chat-path transcript failure."
+        )
+        bound_name = imports[module]
+        if expected_name is not None:
+            assert bound_name == expected_name, (
+                f"app.py imports `from {module} import init_youtube` but binds it to "
+                f"`{bound_name!r}`; expected `{expected_name!r}`."
+            )
+        assert bound_name in calls, (
+            f"app.py imports init_youtube from {module} as `{bound_name}` but never "
+            f"calls it at module level. The {module} module's YOUTUBE_AVAILABLE flag "
+            "stays False and its callers short-circuit."
+        )
 
 
 def test_both_youtube_modules_have_init_youtube_symbol():
     """Sanity check: the symbols the test references actually exist on the legacy module."""
-    # This is the module the chat path uses.
     legacy = sys.modules.get("src.youtube_handler")
     if legacy is None:
         import src.youtube_handler  # noqa: F401
@@ -92,7 +131,6 @@ def test_chat_path_short_circuits_when_legacy_module_not_initialized(monkeypatch
     ):
         monkeypatch.delitem(sys.modules, name, raising=False)
 
-    import asyncio
     import src.youtube_handler as legacy
 
     # Pre-condition: the legacy module's flag is False by default because
